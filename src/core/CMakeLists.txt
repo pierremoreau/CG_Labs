@@ -50,6 +50,7 @@ target_link_libraries (
 	PRIVATE
 		CG_Labs_options
 		stb::stb
+		Threads::Threads
 )
 
 install (TARGETS bonobo DESTINATION lib)

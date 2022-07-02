@@ -13,10 +13,12 @@
 #include <stb_image.h>
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <thread>
 
 namespace
 {
@@ -144,9 +146,47 @@ bonobo::loadObjects(std::string const& filename)
 	auto const materials_start_time = std::chrono::high_resolution_clock::now();
 	std::vector<texture_bindings> materials_bindings(assimp_scene->mNumMaterials);
 	std::vector<material_data> material_constants(assimp_scene->mNumMaterials);
+
 	uint32_t texture_count = 0u;
-	uint32_t texture_uploaded_byte_size = 0u;
+	// Count all available textures.
 	for (size_t i = 0; i < assimp_scene->mNumMaterials; ++i) {
+		if (!are_materials_used[i])
+			continue;
+
+		auto const material = assimp_scene->mMaterials[i];
+
+		auto const process_texture = [&material,&texture_count](aiTextureType type, std::string const& type_as_str, std::string const& name){
+			auto const type_count = material->GetTextureCount(type);
+			if (type_count <= 0) {
+				return;
+			}
+
+			if (type_count > 1)
+				LogWarning("Material \"%s\" has more than one %s texture: discarding all but the first one.", material->GetName().C_Str(), type_as_str.c_str());
+			++texture_count;
+		};
+
+		process_texture(aiTextureType_DIFFUSE,  "diffuse",  "diffuse_texture");
+		process_texture(aiTextureType_SPECULAR, "specular", "specular_texture");
+		process_texture(aiTextureType_NORMALS,  "normals",  "normals_texture");
+		process_texture(aiTextureType_OPACITY,  "opacity",  "opacity_texture");
+	}
+
+	struct TextureInfo {
+		stbi_uc* data = nullptr;
+		GLsizei width = 0;
+		GLsizei height = 0;
+		std::string path;
+		std::string name;
+		std::string binding_name;
+		std::string type_name;
+	};
+	std::vector<TextureInfo> texture_infos(texture_count);
+	std::vector<uint32_t> texture_to_material(texture_count);
+
+	// Process material constants and queue up the textures to be loaded.
+	auto const processing_start_time = std::chrono::high_resolution_clock::now();
+	for (size_t i = 0, texture_index = 0; i < assimp_scene->mNumMaterials; ++i) {
 		if (!are_materials_used[i])
 			continue;
 
@@ -155,31 +195,21 @@ bonobo::loadObjects(std::string const& filename)
 		material_data& constants = material_constants[i];
 		auto const material = assimp_scene->mMaterials[i];
 
-		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_count,&texture_uploaded_byte_size](aiTextureType type, std::string const& type_as_str, std::string const& name){
-			if (material->GetTextureCount(type)) {
-				auto const texture_start_time = std::chrono::high_resolution_clock::now();
-
-				if (material->GetTextureCount(type) > 1)
-					LogWarning("Material \"%s\" has more than one %s texture: discarding all but the first one.", material->GetName().C_Str(), type_as_str.c_str());
-				aiString path;
-				material->GetTexture(type, 0, &path);
-				uint32_t texture_byte_size = 0u;
-				auto const id = bonobo::loadTexture2D(parent_folder + std::string(path.C_Str()), true, &texture_byte_size);
-				if (id == 0u) {
-					LogWarning("Failed to load the %s texture for material \"%s\".", type_as_str.c_str(), material->GetName().C_Str());
-					return;
-				}
-				bindings.emplace(name, id);
-				++texture_count;
-				texture_uploaded_byte_size += texture_byte_size;
-
-				utils::opengl::debug::nameObject(GL_TEXTURE, id, std::string(material->GetName().C_Str()) + " " + type_as_str);
-
-				auto const texture_end_time = std::chrono::high_resolution_clock::now();
-				LogTrivia("│ %s Texture \"%s\" loaded in %.3f ms",
-				          bindings.size() == 1 ? "┌" : "├", path.C_Str(),
-				          std::chrono::duration<float, std::milli>(texture_end_time - texture_start_time).count());
+		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_infos,&texture_index,&texture_to_material](aiTextureType type, std::string const& type_as_str, std::string const& name){
+			if (material->GetTextureCount(type) <= 0) {
+				return;
 			}
+
+			aiString path;
+			material->GetTexture(type, 0, &path);
+
+			auto& texture_info = texture_infos[texture_index];
+			texture_info.path = parent_folder + std::string(path.C_Str());
+			texture_info.binding_name = name;
+			texture_info.type_name = type_as_str;
+			texture_to_material[texture_index] = i;
+
+			++texture_index;
 		};
 
 		aiColor3D color;
@@ -202,10 +232,86 @@ bonobo::loadObjects(std::string const& filename)
 		process_texture(aiTextureType_OPACITY,  "opacity",  "opacity_texture");
 
 		auto const material_end_time = std::chrono::high_resolution_clock::now();
-		LogTrivia("│ %s Material \"%s\" loaded in %.3f ms",
+		LogTrivia("│ %s Material \"%s\" processed in %.3f ms",
 		          bindings.empty() ? "╺" : "┕", material->GetName().C_Str(),
 		          std::chrono::duration<float, std::milli>(material_end_time - material_start_time).count());
 	}
+	auto const processing_end_time = std::chrono::high_resolution_clock::now();
+
+	// Parallelise the parsing and decompression of textures (from JPEG,
+	// PNG, etc.) into a linear buffer of texels to be uploaded to the GPU.
+	auto const parsing_start_time = std::chrono::high_resolution_clock::now();
+	auto thread_count = std::thread::hardware_concurrency();
+	if (thread_count == 0u) {
+		thread_count = 1u;
+	}
+	std::vector<std::thread> parsing_threads(thread_count - 1u);
+	std::atomic<uint32_t> processing_index{0u};
+	std::atomic<uint32_t> processed_uploaded_texture_byte_size{0u};
+	stbi_set_flip_vertically_on_load(1);
+	auto const parse_textures = [&texture_infos, &processing_index, &processed_uploaded_texture_byte_size, texture_count](){
+		std::uint32_t const item_count{4u};
+		std::uint32_t item_start = 0u;
+		while ((item_start = processing_index.fetch_add(item_count, std::memory_order_relaxed)) < texture_count) {
+			for (size_t texture_index = item_start; texture_index < std::min(item_start + item_count, texture_count); ++texture_index) {
+				auto& texture_info = texture_infos[texture_index];
+
+				auto const channels_nb = 4u;
+				texture_info.data = stbi_load(texture_info.path.c_str(), &texture_info.width, &texture_info.height, nullptr, channels_nb);
+
+				if (!texture_info.data) {
+					LogWarning("│ Couldn't load or decode image file %s", texture_info.path.c_str());
+
+					// Provide a small empty image instead in case of failure.
+					texture_info.width = 16;
+					texture_info.height = 16;
+
+					texture_info.data = reinterpret_cast<stbi_uc*>(malloc(texture_info.width * texture_info.height * channels_nb));
+					for (uint32_t i = 0u; i < texture_info.width * texture_info.height; ++i) {
+						reinterpret_cast<std::uint32_t*>(texture_info.data)[i] = 0xffff00ff;
+					}
+				}
+
+				processed_uploaded_texture_byte_size.fetch_add(texture_info.width * texture_info.height * 4u, std::memory_order_relaxed);
+			}
+		}
+	};
+	for (auto& thread : parsing_threads) {
+		thread = std::thread(parse_textures);
+	}
+	parse_textures();
+	for (auto& thread : parsing_threads) {
+		thread.join();
+	}
+	auto const parsing_end_time = std::chrono::high_resolution_clock::now();
+
+	std::vector<GLuint> texture_ids(texture_count);
+	glGenTextures(texture_ids.size(), texture_ids.data());
+
+	// Upload all textures to the GPU.
+	auto const uploading_start_time = std::chrono::high_resolution_clock::now();
+	for (uint32_t i = 0u; i < texture_count; ++i) {
+		auto const texture_id = texture_ids[i];
+		assert(texture_id > 0u);
+		auto const texture_info = texture_infos[i];
+		auto const material_index = texture_to_material[i];
+		auto const material = assimp_scene->mMaterials[material_index];
+		texture_bindings& bindings = materials_bindings[material_index];
+
+		glBindTexture(GL_TEXTURE_2D, texture_id);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture_info.width, texture_info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<GLvoid const*>(texture_info.data));
+		glGenerateMipmap(GL_TEXTURE_2D);
+		utils::opengl::debug::nameObject(GL_TEXTURE, texture_id, std::string(material->GetName().C_Str()) + " " + texture_info.type_name);
+
+		stbi_image_free(texture_info.data);
+
+		bindings.emplace(texture_info.binding_name, texture_id);
+	}
+	auto const uploading_end_time = std::chrono::high_resolution_clock::now();
+	glBindTexture(GL_TEXTURE_2D, 0u);
+
 	auto const materials_end_time = std::chrono::high_resolution_clock::now();
 
 	auto const meshes_start_time = std::chrono::high_resolution_clock::now();
@@ -395,6 +501,7 @@ bonobo::loadObjects(std::string const& filename)
 	};
 
 	uint64_t const vertex_attributes_uploaded_byte_size = normals_uploaded_byte_size + texcoords_uploaded_byte_size + tangents_uploaded_byte_size + binormals_uploaded_byte_size;
+	uint64_t const texture_uploaded_byte_size = processed_uploaded_texture_byte_size.load(std::memory_order_relaxed);
 	uint64_t const total_uploaded_byte_size = mesh_uploaded_byte_size + texture_uploaded_byte_size;
 
 	char total_uploaded_size_str[max_str_len];
@@ -410,17 +517,22 @@ bonobo::loadObjects(std::string const& filename)
 	char texture_uploaded_size_str[max_str_len];
 	byte_size_to_str(texture_uploaded_byte_size, texture_uploaded_size_str);
 
-	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s, %u textures loaded in %.3f s and %zu meshes in %.3f s.\n"
-	        "  %s worth of data was uploaded to the GPU: %s from meshes (vertices: %s, vertex attributes: %s, indices: %s), and %s from textures.",
+	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s, %u textures loaded in %.3f s (processing: %.3f ms, parsing: %.3f ms, uploading: %.3f ms) and %zu meshes in %.3f s.\n"
+	        "  %s worth of data was uploaded to the GPU: %s from meshes (vertices: %s, vertex attributes: %s, indices: %s), and %s from textures.\n"
+	        "  The textures were parsed using %d threads.",
 	        std::chrono::duration<float>(scene_end_time - scene_start_time).count(),
 	        std::chrono::duration<float>(importer_end_time - importer_start_time).count(),
 	        texture_count,
 	        std::chrono::duration<float>(materials_end_time - materials_start_time).count(),
+	        std::chrono::duration<float, std::milli>(processing_end_time - processing_start_time).count(),
+	        std::chrono::duration<float, std::milli>(parsing_end_time - parsing_start_time).count(),
+	        std::chrono::duration<float, std::milli>(uploading_end_time - uploading_start_time).count(),
 	        objects.size(),
 	        std::chrono::duration<float>(meshes_end_time - meshes_start_time).count(),
 	        total_uploaded_size_str, mesh_uploaded_size_str,
 	        vertices_uploaded_size_str, vertex_attributes_uploaded_size_str, indices_uploaded_size_str,
-	        texture_uploaded_size_str);
+	        texture_uploaded_size_str,
+	        thread_count);
 
 	return objects;
 }

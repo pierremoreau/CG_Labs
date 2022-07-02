@@ -33,6 +33,11 @@ endif (NOT CMAKE_BUILD_TYPE)
 set_property (CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS ${CMAKE_CONFIGURATION_TYPES})
 
 
+# Multi-threading is used when processing textures in `bonobo::loadObjects()`.
+# Even if it is using C++11’s threading capabilities, some old compilers might
+# still require explicitly linking against a threading library, like pthread.
+find_package (Threads REQUIRED)
+
 # To be able to dowload and compile the dependencies
 find_package (Git REQUIRED)
 include (FetchContent)
