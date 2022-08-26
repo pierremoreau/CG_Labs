@@ -114,12 +114,14 @@ bonobo::loadObjects(std::string const& filename)
 
 	auto const end_of_basedir = filename.rfind("/");
 	auto const parent_folder = (end_of_basedir != std::string::npos ? filename.substr(0, end_of_basedir) : ".") + "/";
+	auto const importer_start_time = std::chrono::high_resolution_clock::now();
 	Assimp::Importer importer;
 	auto const assimp_scene = importer.ReadFile(filename, aiProcess_Triangulate | aiProcess_SortByPType | aiProcess_CalcTangentSpace);
 	if (assimp_scene == nullptr || assimp_scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || assimp_scene->mRootNode == nullptr) {
 		LogError("Assimp failed to load \"%s\": %s", filename.c_str(), importer.GetErrorString());
 		return objects;
 	}
+	auto const importer_end_time = std::chrono::high_resolution_clock::now();
 
 	if (assimp_scene->mNumMeshes == 0u) {
 		LogError("No mesh available; loading \"%s\" must have had issues", filename.c_str());
@@ -345,8 +347,9 @@ bonobo::loadObjects(std::string const& filename)
 	auto const meshes_end_time = std::chrono::high_resolution_clock::now();
 
 	auto const scene_end_time = std::chrono::high_resolution_clock::now();
-	LogInfo("┕ Scene loaded in %.3f s: %u textures loaded in %.3f s and %zu meshes in %.3f s",
+	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s,  %u textures loaded in %.3f s and %zu meshes in %.3f s",
 	        std::chrono::duration<float>(scene_end_time - scene_start_time).count(),
+	        std::chrono::duration<float>(importer_end_time - importer_start_time).count(),
 	        texture_count,
 	        std::chrono::duration<float>(materials_end_time - materials_start_time).count(),
 	        objects.size(),
