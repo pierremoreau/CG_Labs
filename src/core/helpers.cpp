@@ -15,6 +15,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 
 namespace
@@ -144,6 +145,7 @@ bonobo::loadObjects(std::string const& filename)
 	std::vector<texture_bindings> materials_bindings(assimp_scene->mNumMaterials);
 	std::vector<material_data> material_constants(assimp_scene->mNumMaterials);
 	uint32_t texture_count = 0u;
+	uint32_t texture_uploaded_byte_size = 0u;
 	for (size_t i = 0; i < assimp_scene->mNumMaterials; ++i) {
 		if (!are_materials_used[i])
 			continue;
@@ -153,7 +155,7 @@ bonobo::loadObjects(std::string const& filename)
 		material_data& constants = material_constants[i];
 		auto const material = assimp_scene->mMaterials[i];
 
-		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_count](aiTextureType type, std::string const& type_as_str, std::string const& name){
+		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_count,&texture_uploaded_byte_size](aiTextureType type, std::string const& type_as_str, std::string const& name){
 			if (material->GetTextureCount(type)) {
 				auto const texture_start_time = std::chrono::high_resolution_clock::now();
 
@@ -161,13 +163,15 @@ bonobo::loadObjects(std::string const& filename)
 					LogWarning("Material \"%s\" has more than one %s texture: discarding all but the first one.", material->GetName().C_Str(), type_as_str.c_str());
 				aiString path;
 				material->GetTexture(type, 0, &path);
-				auto const id = bonobo::loadTexture2D(parent_folder + std::string(path.C_Str()));
+				uint32_t texture_byte_size = 0u;
+				auto const id = bonobo::loadTexture2D(parent_folder + std::string(path.C_Str()), true, &texture_byte_size);
 				if (id == 0u) {
 					LogWarning("Failed to load the %s texture for material \"%s\".", type_as_str.c_str(), material->GetName().C_Str());
 					return;
 				}
 				bindings.emplace(name, id);
 				++texture_count;
+				texture_uploaded_byte_size += texture_byte_size;
 
 				utils::opengl::debug::nameObject(GL_TEXTURE, id, std::string(material->GetName().C_Str()) + " " + type_as_str);
 
@@ -206,6 +210,13 @@ bonobo::loadObjects(std::string const& filename)
 
 	auto const meshes_start_time = std::chrono::high_resolution_clock::now();
 	objects.reserve(assimp_scene->mNumMeshes);
+	uint32_t mesh_uploaded_byte_size = 0u;
+	uint32_t vertices_uploaded_byte_size = 0u;
+	uint32_t normals_uploaded_byte_size = 0u;
+	uint32_t texcoords_uploaded_byte_size = 0u;
+	uint32_t tangents_uploaded_byte_size = 0u;
+	uint32_t binormals_uploaded_byte_size = 0u;
+	uint32_t indices_uploaded_byte_size = 0u;
 	for (size_t j = 0; j < assimp_scene->mNumMeshes; ++j) {
 		auto const mesh_start_time = std::chrono::high_resolution_clock::now();
 
@@ -261,6 +272,14 @@ bonobo::loadObjects(std::string const& filename)
 		                                            +tangents_size
 		                                            +binormals_size
 		                                            );
+
+		vertices_uploaded_byte_size += vertices_size;
+		normals_uploaded_byte_size += normals_size;
+		texcoords_uploaded_byte_size += texcoords_size;
+		tangents_uploaded_byte_size += tangents_size;
+		binormals_uploaded_byte_size += binormals_size;
+		mesh_uploaded_byte_size += bo_size;
+
 		glGenBuffers(1, &object.bo);
 		assert(object.bo != 0u);
 		glBindBuffer(GL_ARRAY_BUFFER, object.bo);
@@ -306,10 +325,15 @@ bonobo::loadObjects(std::string const& filename)
 			if (num_vertices_per_face >= 2u)
 				object_indices[num_vertices_per_face * i + 2u] = face.mIndices[2u];
 		}
+
+		auto const ibo_size = static_cast<unsigned int>(object.indices_nb) * sizeof(GLuint);
+		indices_uploaded_byte_size += ibo_size;
+		mesh_uploaded_byte_size += ibo_size;
+
 		glGenBuffers(1, &object.ibo);
 		assert(object.ibo != 0u);
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, object.ibo);
-		glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<unsigned int>(object.indices_nb) * sizeof(GL_UNSIGNED_INT), reinterpret_cast<GLvoid const*>(object_indices.get()), GL_STATIC_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibo_size, reinterpret_cast<GLvoid const*>(object_indices.get()), GL_STATIC_DRAW);
 		object_indices.reset(nullptr);
 
 		utils::opengl::debug::nameObject(GL_VERTEX_ARRAY, object.vao, object.name + " VAO");
@@ -347,13 +371,56 @@ bonobo::loadObjects(std::string const& filename)
 	auto const meshes_end_time = std::chrono::high_resolution_clock::now();
 
 	auto const scene_end_time = std::chrono::high_resolution_clock::now();
-	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s,  %u textures loaded in %.3f s and %zu meshes in %.3f s",
+
+	uint32_t constexpr max_str_len = 4u/* <1024 */ + 1u/* . */ + 3u/* <=3 fractional digits */ + 1u/* ' ' */ + 3u/* unit */ + 1u/* \0 */;
+	auto const byte_size_to_str = [](uint64_t const integer_size, char output_string[max_str_len]) {
+		uint32_t unit_index = 0u;
+		double size = static_cast<double>(integer_size);
+		while (size >= 1024.0 && unit_index < 4) {
+			size /= 1024.0;
+			++unit_index;
+		}
+
+		int written_characters = std::snprintf(output_string, max_str_len, "%.3lf ", size);
+		assert(written_characters > 0 && written_characters < (max_str_len - 4u));
+
+		// Anything beyond 'G' should be needed for some time.
+		char const unit_prefixes[] = { 'K', 'M', 'G' };
+		if (unit_index > 0u) {
+			output_string[written_characters++] = unit_prefixes[unit_index - 1u];
+			output_string[written_characters++] = 'i';
+		}
+		output_string[written_characters++] = 'B';
+		output_string[written_characters++] = '\0';
+	};
+
+	uint64_t const vertex_attributes_uploaded_byte_size = normals_uploaded_byte_size + texcoords_uploaded_byte_size + tangents_uploaded_byte_size + binormals_uploaded_byte_size;
+	uint64_t const total_uploaded_byte_size = mesh_uploaded_byte_size + texture_uploaded_byte_size;
+
+	char total_uploaded_size_str[max_str_len];
+	byte_size_to_str(total_uploaded_byte_size, total_uploaded_size_str);
+	char mesh_uploaded_size_str[max_str_len];
+	byte_size_to_str(mesh_uploaded_byte_size, mesh_uploaded_size_str);
+	char vertices_uploaded_size_str[max_str_len];
+	byte_size_to_str(vertices_uploaded_byte_size, vertices_uploaded_size_str);
+	char vertex_attributes_uploaded_size_str[max_str_len];
+	byte_size_to_str(vertex_attributes_uploaded_byte_size, vertex_attributes_uploaded_size_str);
+	char indices_uploaded_size_str[max_str_len];
+	byte_size_to_str(indices_uploaded_byte_size, indices_uploaded_size_str);
+	char texture_uploaded_size_str[max_str_len];
+	byte_size_to_str(texture_uploaded_byte_size, texture_uploaded_size_str);
+
+	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s, %u textures loaded in %.3f s and %zu meshes in %.3f s.\n"
+	        "  %s worth of data was uploaded to the GPU: %s from meshes (vertices: %s, vertex attributes: %s, indices: %s), and %s from textures.",
 	        std::chrono::duration<float>(scene_end_time - scene_start_time).count(),
 	        std::chrono::duration<float>(importer_end_time - importer_start_time).count(),
 	        texture_count,
 	        std::chrono::duration<float>(materials_end_time - materials_start_time).count(),
 	        objects.size(),
-	        std::chrono::duration<float>(meshes_end_time - meshes_start_time).count());
+	        std::chrono::duration<float>(meshes_end_time - meshes_start_time).count(),
+	        total_uploaded_size_str, mesh_uploaded_size_str,
+	        vertices_uploaded_size_str, vertex_attributes_uploaded_size_str, indices_uploaded_size_str,
+	        texture_uploaded_size_str);
 
 	return objects;
 }
@@ -385,12 +452,15 @@ bonobo::createTexture(uint32_t width, uint32_t height, GLenum target, GLint inte
 }
 
 GLuint
-bonobo::loadTexture2D(std::string const& filename, bool generate_mipmap)
+bonobo::loadTexture2D(std::string const& filename, bool generate_mipmap, uint32_t* texture_byte_size)
 {
 	std::uint32_t width, height;
 	auto const data = getTextureData(filename, width, height, true);
 	if (data.empty())
 		return 0u;
+
+	if (texture_byte_size)
+		*texture_byte_size = width * height * 4u;
 
 	GLuint texture = bonobo::createTexture(width, height, GL_TEXTURE_2D, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<GLvoid const*>(data.data()));
 	glBindTexture(GL_TEXTURE_2D, texture);

@@ -99,9 +99,12 @@ namespace bonobo
 	//!
 	//! @param [in] filename of the image.
 	//! @param [in] generate_mipmap whether or not to generate a mipmap hierarchy
+	//! @param [out] texture_byte_size output the byte-size of the loaded
+	//!              texture, if a valid pointer is provided.
 	//! @return the name of the OpenGL 2D-texture
 	GLuint loadTexture2D(std::string const& filename,
-	                     bool generate_mipmap = true);
+	                     bool generate_mipmap = true,
+	                     uint32_t* texture_byte_size = nullptr);
 
 	//! \brief Load six images into an OpenGL cubemap-texture.
 	//!
