@@ -173,16 +173,15 @@ bonobo::loadObjects(std::string const& filename)
 	}
 
 	struct TextureInfo {
-		stbi_uc* data = nullptr;
+		std::string path;
 		GLsizei width = 0;
 		GLsizei height = 0;
-		std::string path;
-		std::string name;
-		std::string binding_name;
-		std::string type_name;
 	};
 	std::vector<TextureInfo> texture_infos(texture_count);
 	std::vector<uint32_t> texture_to_material(texture_count);
+
+	std::vector<GLuint> texture_ids(texture_count);
+	glGenTextures(texture_ids.size(), texture_ids.data());
 
 	// Process material constants and queue up the textures to be loaded.
 	auto const processing_start_time = std::chrono::high_resolution_clock::now();
@@ -195,7 +194,7 @@ bonobo::loadObjects(std::string const& filename)
 		material_data& constants = material_constants[i];
 		auto const material = assimp_scene->mMaterials[i];
 
-		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_infos,&texture_index,&texture_to_material](aiTextureType type, std::string const& type_as_str, std::string const& name){
+		auto const process_texture = [&bindings,&material,i,&parent_folder,&texture_infos,&texture_index,&texture_to_material,&texture_ids](aiTextureType type, std::string const& type_as_str, std::string const& name){
 			if (material->GetTextureCount(type) <= 0) {
 				return;
 			}
@@ -205,9 +204,16 @@ bonobo::loadObjects(std::string const& filename)
 
 			auto& texture_info = texture_infos[texture_index];
 			texture_info.path = parent_folder + std::string(path.C_Str());
-			texture_info.binding_name = name;
-			texture_info.type_name = type_as_str;
-			texture_to_material[texture_index] = i;
+
+			auto const texture_id = texture_ids[texture_index];
+			assert(texture_id > 0u);
+
+			glBindTexture(GL_TEXTURE_2D, texture_id);
+			utils::opengl::debug::nameObject(GL_TEXTURE, texture_id, std::string(material->GetName().C_Str()) + " " + type_as_str);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+			bindings.emplace(name, texture_id);
 
 			++texture_index;
 		};
@@ -245,72 +251,160 @@ bonobo::loadObjects(std::string const& filename)
 	if (thread_count == 0u) {
 		thread_count = 1u;
 	}
-	std::vector<std::thread> parsing_threads(thread_count - 1u);
-	std::atomic<uint32_t> processing_index{0u};
-	std::atomic<uint32_t> processed_uploaded_texture_byte_size{0u};
+
+	uint32_t const upload_block_byte_size = 16u * 1024 * 1024 * thread_count;
+	std::array<GLuint, 2u> pbos = { 0u, 0u };
+	glGenBuffers(2, pbos.data());
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[1u]);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, upload_block_byte_size, nullptr, GL_DYNAMIC_DRAW);
+	utils::opengl::debug::nameObject(GL_TEXTURE, pbos[1u], "Texture-upload buffer 1");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[0u]);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, upload_block_byte_size, nullptr, GL_DYNAMIC_DRAW);
+	utils::opengl::debug::nameObject(GL_TEXTURE, pbos[0u], "Texture-upload buffer 0");
+	std::uint32_t upload_block_index = 0;
+	auto* upload_block_ptr = reinterpret_cast<stbi_uc*>(glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY));
+
+	std::atomic_uint processed_textures_counter{ 0u };
+	std::atomic_uint processed_uploaded_texture_byte_size{ 0u };
+	std::atomic_uint upload_block_offset{ 0u };
+	std::atomic_uint idle_threads_counter{ 0u };
+
+	struct UploadInfo final {
+		uint32_t texture_index = 0u;
+		uint32_t offset_in_block = 0u;
+	};
+	std::array<UploadInfo, 1024> current_upload_slots;
+	std::array<UploadInfo, 1024> pending_upload_slots;
+	std::atomic_uint current_upload_slot_counter{ 0u };
+
 	stbi_set_flip_vertically_on_load(1);
-	auto const parse_textures = [&texture_infos, &processing_index, &processed_uploaded_texture_byte_size, texture_count](){
-		std::uint32_t const item_count{4u};
-		std::uint32_t item_start = 0u;
-		while ((item_start = processing_index.fetch_add(item_count, std::memory_order_relaxed)) < texture_count) {
-			for (size_t texture_index = item_start; texture_index < std::min(item_start + item_count, texture_count); ++texture_index) {
-				auto& texture_info = texture_infos[texture_index];
+	auto const parse_textures = [&](bool is_main_thread){
+		uint32_t texture_index = 0u;
+		while ((texture_index = processed_textures_counter.fetch_add(1u, std::memory_order_relaxed)) < texture_count) {
+			auto& texture_info = texture_infos[texture_index];
 
-				auto const channels_nb = 4u;
-				texture_info.data = stbi_load(texture_info.path.c_str(), &texture_info.width, &texture_info.height, nullptr, channels_nb);
+			auto const channels_nb = 4u;
+			stbi_uc* data = stbi_load(texture_info.path.c_str(), &texture_info.width, &texture_info.height, nullptr, channels_nb);
+			if (!data) {
+				LogWarning("│ Couldn't load or decode image file %s", texture_info.path.c_str());
 
-				if (!texture_info.data) {
-					LogWarning("│ Couldn't load or decode image file %s", texture_info.path.c_str());
+				// Provide a small empty image instead in case of failure.
+				texture_info.width = 16;
+				texture_info.height = 16;
 
-					// Provide a small empty image instead in case of failure.
-					texture_info.width = 16;
-					texture_info.height = 16;
+				data = reinterpret_cast<stbi_uc*>(malloc(texture_info.width * texture_info.height * channels_nb));
+				for (uint32_t i = 0u; i < texture_info.width * texture_info.height; ++i) {
+					reinterpret_cast<std::uint32_t*>(data)[i] = 0xffff00ff;
+				}
+			}
 
-					texture_info.data = reinterpret_cast<stbi_uc*>(malloc(texture_info.width * texture_info.height * channels_nb));
-					for (uint32_t i = 0u; i < texture_info.width * texture_info.height; ++i) {
-						reinterpret_cast<std::uint32_t*>(texture_info.data)[i] = 0xffff00ff;
+			uint32_t const texture_byte_size = texture_info.width * texture_info.height * channels_nb;
+			uint32_t upload_offset = 0u;
+			while (((upload_offset = upload_block_offset.fetch_add(texture_byte_size, std::memory_order_relaxed)) + texture_byte_size) > upload_block_byte_size) {
+				using namespace std::chrono_literals;
+
+				if (is_main_thread) {
+					// Busy-wait until all threads are waiting on
+					// the upload block to be swapped.
+					uint32_t idle_threads_count = 0u;
+					while ((idle_threads_count = idle_threads_counter.load(std::memory_order_acquire)) != (thread_count - 1u)) {
+						std::this_thread::sleep_for(1ms);
+					}
+
+					uint32_t const pending_block_index = upload_block_index;
+
+					glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[upload_block_index]);
+					glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+					GLsync const pending_block_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+					std::swap(current_upload_slots, pending_upload_slots);
+					uint32_t const pending_texture_uploads = current_upload_slot_counter.load(std::memory_order_acquire);
+					current_upload_slot_counter.store(0u, std::memory_order_release);
+
+					upload_block_index = 1u - upload_block_index;
+					glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[upload_block_index]);
+					upload_block_ptr = reinterpret_cast<stbi_uc*>(glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY));
+					upload_block_offset.store(0u, std::memory_order_release);
+					idle_threads_counter.store(0u, std::memory_order_release); // This will unlock the other threads.
+
+					// While the other threads start
+					// processing new textures, have the
+					// main thread wait on the latest upload
+					// and associate the data to the
+					// textures.
+					// Uploading should be faster than
+					// processing textures, so the other
+					// threads should not end up waiting on
+					// this step to be done.
+					auto const status = glClientWaitSync(pending_block_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000llu);
+					assert(status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED);
+
+					glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[pending_block_index]);
+					for (uint32_t upload_slot_index = 0u; upload_slot_index < pending_texture_uploads; ++upload_slot_index) {
+						auto const& upload_info = pending_upload_slots[upload_slot_index];
+						auto const texture_id = texture_ids[upload_info.texture_index];
+						auto const& texture_info = texture_infos[upload_info.texture_index];
+						uint32_t const upload_size = texture_info.width * texture_info.height * channels_nb;
+
+						assert(upload_info.offset_in_block + upload_size <= upload_block_byte_size);
+						glBindTexture(GL_TEXTURE_2D, texture_id);
+						glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture_info.width, texture_info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<GLvoid const*>(upload_info.offset_in_block));
+						glGenerateMipmap(GL_TEXTURE_2D);
+					}
+				} else {
+					idle_threads_counter.fetch_add(1u, std::memory_order_release);
+
+					// Busy-wait until the upload block was swapped.
+					while (idle_threads_counter.load(std::memory_order_acquire) > 0u) {
+						std::this_thread::sleep_for(4ms);
 					}
 				}
-
-				processed_uploaded_texture_byte_size.fetch_add(texture_info.width * texture_info.height * 4u, std::memory_order_relaxed);
 			}
+
+			assert(upload_offset + texture_byte_size <= upload_block_byte_size);
+			processed_uploaded_texture_byte_size.fetch_add(texture_byte_size, std::memory_order_relaxed);
+			std::memcpy(upload_block_ptr + upload_offset, data, texture_byte_size);
+			stbi_image_free(data);
+
+			uint32_t const upload_slot_index = current_upload_slot_counter.fetch_add(1u, std::memory_order_relaxed);
+			current_upload_slots[upload_slot_index] = { texture_index, upload_offset };
 		}
 	};
+
+	std::vector<std::thread> parsing_threads(thread_count - 1u);
 	for (auto& thread : parsing_threads) {
-		thread = std::thread(parse_textures);
+		thread = std::thread(parse_textures, false);
 	}
-	parse_textures();
+	parse_textures(true);
 	for (auto& thread : parsing_threads) {
 		thread.join();
 	}
-	auto const parsing_end_time = std::chrono::high_resolution_clock::now();
 
-	std::vector<GLuint> texture_ids(texture_count);
-	glGenTextures(texture_ids.size(), texture_ids.data());
+	// Upload the remaining textures.
+	uint32_t const pending_texture_uploads = current_upload_slot_counter.load(std::memory_order_acquire);
+	if (pending_texture_uploads > 0u) {
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[upload_block_index]);
+		glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+		GLsync const pending_block_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-	// Upload all textures to the GPU.
-	auto const uploading_start_time = std::chrono::high_resolution_clock::now();
-	for (uint32_t i = 0u; i < texture_count; ++i) {
-		auto const texture_id = texture_ids[i];
-		assert(texture_id > 0u);
-		auto const texture_info = texture_infos[i];
-		auto const material_index = texture_to_material[i];
-		auto const material = assimp_scene->mMaterials[material_index];
-		texture_bindings& bindings = materials_bindings[material_index];
+		auto const status = glClientWaitSync(pending_block_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000llu);
+		assert(status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED);
 
-		glBindTexture(GL_TEXTURE_2D, texture_id);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture_info.width, texture_info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<GLvoid const*>(texture_info.data));
-		glGenerateMipmap(GL_TEXTURE_2D);
-		utils::opengl::debug::nameObject(GL_TEXTURE, texture_id, std::string(material->GetName().C_Str()) + " " + texture_info.type_name);
+		for (uint32_t upload_slot_index = 0u; upload_slot_index < pending_texture_uploads; ++upload_slot_index) {
+			auto const& upload_info = current_upload_slots[upload_slot_index];
+			auto const texture_id = texture_ids[upload_info.texture_index];
+			auto const& texture_info = texture_infos[upload_info.texture_index];
+			uint32_t const upload_size = texture_info.width * texture_info.height * 4u;
 
-		stbi_image_free(texture_info.data);
-
-		bindings.emplace(texture_info.binding_name, texture_id);
+			assert(upload_info.offset_in_block + upload_size <= upload_block_byte_size);
+			glBindTexture(GL_TEXTURE_2D, texture_id);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture_info.width, texture_info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<GLvoid const*>(upload_info.offset_in_block));
+			glGenerateMipmap(GL_TEXTURE_2D);
+		}
 	}
-	auto const uploading_end_time = std::chrono::high_resolution_clock::now();
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0u);
 	glBindTexture(GL_TEXTURE_2D, 0u);
+	auto const parsing_end_time = std::chrono::high_resolution_clock::now();
 
 	auto const materials_end_time = std::chrono::high_resolution_clock::now();
 
@@ -517,7 +611,7 @@ bonobo::loadObjects(std::string const& filename)
 	char texture_uploaded_size_str[max_str_len];
 	byte_size_to_str(texture_uploaded_byte_size, texture_uploaded_size_str);
 
-	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s, %u textures loaded in %.3f s (processing: %.3f ms, parsing: %.3f ms, uploading: %.3f ms) and %zu meshes in %.3f s.\n"
+	LogInfo("┕ Scene loaded in %.3f s: imported by assimp in %.3f s, %u textures loaded in %.3f s (processing: %.3f ms, parsing & uploading: %.3f ms) and %zu meshes in %.3f s.\n"
 	        "  %s worth of data was uploaded to the GPU: %s from meshes (vertices: %s, vertex attributes: %s, indices: %s), and %s from textures.\n"
 	        "  The textures were parsed using %d threads.",
 	        std::chrono::duration<float>(scene_end_time - scene_start_time).count(),
@@ -526,7 +620,6 @@ bonobo::loadObjects(std::string const& filename)
 	        std::chrono::duration<float>(materials_end_time - materials_start_time).count(),
 	        std::chrono::duration<float, std::milli>(processing_end_time - processing_start_time).count(),
 	        std::chrono::duration<float, std::milli>(parsing_end_time - parsing_start_time).count(),
-	        std::chrono::duration<float, std::milli>(uploading_end_time - uploading_start_time).count(),
 	        objects.size(),
 	        std::chrono::duration<float>(meshes_end_time - meshes_start_time).count(),
 	        total_uploaded_size_str, mesh_uploaded_size_str,
